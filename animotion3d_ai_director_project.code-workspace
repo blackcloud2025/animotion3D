@@ -1,0 +1,26 @@
+{
+  "folders": [
+    {
+      "path": "."
+    }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv-blender/Scripts/python.exe",
+    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.diagnosticMode": "openFilesOnly",
+    "python.analysis.useLibraryCodeForTypes": true,
+    "python.analysis.extraPaths": [
+      "${workspaceFolder}/.venv-blender/Lib/site-packages"
+    ],
+    "python.analysis.exclude": [
+      "**/__pycache__/**",
+      ".venv-blender/**",
+      "dist/**"
+    ],
+    "python.analysis.diagnosticSeverityOverrides": {
+      "reportInvalidTypeForm": "none",
+      "reportMissingImports": "none",
+      "reportMissingModuleSource": "none"
+    }
+  }
+}

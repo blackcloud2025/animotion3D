@@ -1,0 +1,5 @@
+.venv-blender/
+__pycache__/
+*.pyc
+dist/*.zip
+.vscode/*.code-workspace

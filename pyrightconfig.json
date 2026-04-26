@@ -1,0 +1,13 @@
+{
+  "venvPath": ".",
+  "venv": ".venv-blender",
+  "typeCheckingMode": "basic",
+  "reportInvalidTypeForm": "none",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "exclude": [
+    ".venv-blender",
+    "__pycache__",
+    "dist"
+  ]
+}
