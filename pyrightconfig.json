@@ -8,6 +8,10 @@
   "exclude": [
     ".venv-blender",
     "__pycache__",
-    "dist"
+    "dist",
+    "**/node_modules",
+    "**/.git",
+    "**/__pycache__",
+    "**/.venv*"
   ]
 }
