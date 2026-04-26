@@ -28,8 +28,8 @@ from bpy.types import PropertyGroup, Operator, Panel, UIList, UILayout
 #  CONFIG / DEFAULTS
 # ══════════════════════════════════════════════════════
 DEFAULT_URL     = "http://127.0.0.1:1234/v1/chat/completions"
-DEFAULT_MODEL   = "local-model"
-DEFAULT_TIMEOUT = 120
+DEFAULT_MODEL   = "deepseek/deepseek-r1-0528-qwen3-8b"
+DEFAULT_TIMEOUT = 300
 DEFAULT_RETRIES = -1   # -1 = reintentos infinitos hasta cancelar
 DEFAULT_BACKOFF = 1.0   # segundos base para backoff exponencial
 MAX_BACKOFF_WAIT = 30.0  # límite para que el backoff no crezca sin control
@@ -47,46 +47,27 @@ os.makedirs(DATASET_DIR, exist_ok=True)
 # ══════════════════════════════════════════════════════
 #  SYSTEM PROMPT
 # ══════════════════════════════════════════════════════
-SYSTEM_PROMPT = """You are an expert Blender animation and behavior assistant.
-When the user describes an animation or behavior, respond ONLY with valid JSON and nothing else.
-No explanations, no markdown, no code fences — just raw JSON.
+SYSTEM_PROMPT = """Blender animation assistant. Respond ONLY with raw JSON, no markdown, no explanations.
 
-SUPPORTED ANIMATION TYPES:
+KEYFRAME TYPES:
+{"type":"bone","frame":1,"bone":"<name>","object":"<armature>","loc":[x,y,z],"rot":[xd,yd,zd],"scale":[x,y,z]}
+{"type":"object","frame":1,"object":"<name>","loc":[x,y,z],"rot":[xd,yd,zd],"scale":[x,y,z]}
+{"type":"property","frame":1,"object":"<name>","property":"data.lens","value":50.0}
 
-1. BONE KEYFRAMES (Armature pose):
-    { "type": "bone", "frame": <int>, "bone": "<name>", "object": "<armature_name_optional>", "loc": [x,y,z], "rot": [x_deg,y_deg,z_deg], "scale": [x,y,z] }
+BEHAVIOR TYPES:
+{"type":"set_frame_range","start":1,"end":120}
+{"type":"set_scene_fps","fps":24}
+{"type":"set_interpolation","mode":"BEZIER|LINEAR|CONSTANT","object":"<name>|*"}
+{"type":"set_active_camera","frame":1,"object":"<camera>"}
 
-2. OBJECT KEYFRAMES (Any object - position, rotation, scale):
-   { "type": "object", "frame": <int>, "object": "<name>", "loc": [x,y,z], "rot": [x_deg,y_deg,z_deg], "scale": [x,y,z] }
-
-3. PROPERTY KEYFRAMES (Cameras, lights, materials):
-   { "type": "property", "frame": <int>, "object": "<name>", "property": "<data_path>", "value": <float|list> }
-   Examples: camera FOV → "data.lens", light energy → "data.energy"
-
-4. BEHAVIOR COMMANDS (Optional setup commands):
-    { "type": "set_frame_range", "start": <int>, "end": <int> }
-    { "type": "set_scene_fps", "fps": <int> }
-    { "type": "set_interpolation", "mode": "BEZIER|LINEAR|CONSTANT", "object": "<name>|*" }
-    { "type": "set_active_camera", "frame": <int>, "object": "<camera_name>" }
-
-RETURN FORMAT — always:
-{
-  "animations": [ ...all keyframe actions... ],
-  "behaviors":  [ ...optional setup commands... ],
-  "notes": "brief explanation"
-}
+OUTPUT FORMAT:
+{"animations":[...],"behaviors":[...],"notes":"<brief>"}
 
 RULES:
-- frame >= 1
-- rot values are DEGREES (internally converted to radians)
-- Smooth realistic motion: minimum 3 keyframes per moving element
-- Use EXACT object/bone names from the scene list provided
-- If more than one armature is present, include the 'object' field in bone actions
-- Fill the full frame range naturally
-- You may return only animations, only behaviors, or both
-- Use only the supported behavior command types listed above
-- For multi-camera scenes, use set_active_camera to cut between cameras
-- Never animate objects outside the selected context list
+- frame >= 1, rot in DEGREES
+- Min 3 keyframes per moving element for smooth motion
+- Use EXACT bone/object names from scene list
+- Never animate objects outside the provided context list
 """
 
 # ══════════════════════════════════════════════════════
@@ -677,7 +658,7 @@ def call_lm_studio(messages, url, model, temperature, timeout,
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "stream": False,
+        "stream": True,
     }
     body, err = http_post_with_retries(
         url,
@@ -691,21 +672,30 @@ def call_lm_studio(messages, url, model, temperature, timeout,
         return None, err
     if body is None:
         return None, "Respuesta vacía inesperada del servidor."
-    try:
-        parsed = json.loads(body)
-        if "choices" in parsed:
-            choices = parsed["choices"]
+    # Parsear SSE (Server-Sent Events) del stream
+    content_parts = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+            choices = chunk.get("choices", [])
             if not choices:
-                return None, f"LM Studio devolvió choices vacío. Verifica el modelo. Raw: {body[:200]}"
-            content = choices[0].get("message", {}).get("content", "")
-            if not content:
-                return None, f"LM Studio devolvió contenido vacío en choices[0]. Raw: {body[:200]}"
-            return content.strip(), None
-        if "content" in parsed:
-            return str(parsed["content"]), None
-        return body, None
-    except Exception as e:
-        return None, f"Error parseando respuesta: {e} — raw: {body[:200]}"
+                continue
+            delta = choices[0].get("delta", {})
+            piece = delta.get("content", "")
+            if piece:
+                content_parts.append(piece)
+        except (json.JSONDecodeError, KeyError):
+            continue
+    content = "".join(content_parts).strip()
+    if not content:
+        return None, f"LM Studio devolvió contenido vacío. El modelo puede estar solo razonando sin generar JSON. Raw: {body[:300]}"
+    return content, None
 
 # ══════════════════════════════════════════════════════
 #  PREPARSER  —  extrae JSON aunque venga con basura
@@ -808,7 +798,10 @@ def parse_animation_json(text):
 #  ESCENA  —  scan, validate, apply
 # ══════════════════════════════════════════════════════
 def scan_scene_context(scene, target_obj=None, context_objects=None):
-    """Devuelve un dict con los elementos animables de la escena o del contexto seleccionado."""
+    """Devuelve un dict con los elementos animables del contexto seleccionado solamente.
+    Si context_objects es None y target_obj es None, usa solo el objeto activo o nada.
+    NUNCA hace un scan completo de la escena por defecto.
+    """
     ctx = {
         "armatures": [],
         "objects":   [],
@@ -817,7 +810,8 @@ def scan_scene_context(scene, target_obj=None, context_objects=None):
         "frame_range": [scene.frame_start, scene.frame_end],
         "fps": scene.render.fps,
     }
-    objects = _unique_animatable_objects(context_objects or ([target_obj] if target_obj else scene.objects))
+    # Solo objetos explícitamente seleccionados — nunca toda la escena
+    objects = _unique_animatable_objects(context_objects or ([target_obj] if target_obj else []))
     if target_obj:
         ctx["selected_target"] = {"name": target_obj.name, "type": target_obj.type}
     if objects:
@@ -833,7 +827,6 @@ def scan_scene_context(scene, target_obj=None, context_objects=None):
     for obj in objects:
         d = {"name": obj.name, "type": obj.type}
         if obj.type == "ARMATURE":
-            d.update(_object_transform_snapshot(obj))
             d["bones"] = [b.name for b in obj.pose.bones]
             ctx["armatures"].append(d)
         elif obj.type == "CAMERA":
@@ -1625,12 +1618,10 @@ class AM3D_OT_GenerateAnimation(Operator):
 
         context_objects = _resolve_context_objects(sc, target_obj=target_obj)
         scene_ctx  = scan_scene_context(sc, target_obj=target_obj, context_objects=context_objects)
-        reference_ctx = scan_scene_context(sc)
         full_prompt = (
             f"Animation/Behavior request: {prompt}\n\n"
             f"{_context_instruction(target_obj, context_objects)}\n\n"
-            f"Target details:\n{json.dumps(scene_ctx, indent=2)}\n\n"
-            f"Reference scene:\n{json.dumps(reference_ctx, indent=2)}\n\n"
+            f"Scene:\n{json.dumps(scene_ctx, separators=(',', ':'))}\n\n"
             f"Respond ONLY with JSON (animations, behaviors, notes)."
         )
 
@@ -2288,7 +2279,7 @@ _SCENE_PROPS = {
     "am3d_server_url":        lambda: StringProperty(name="URL", default=DEFAULT_URL),
     "am3d_model_name":        lambda: StringProperty(name="Modelo", default=DEFAULT_MODEL),
     "am3d_temperature":       lambda: FloatProperty(name="Temperatura", default=0.2, min=0.0, max=2.0, step=5),
-    "am3d_timeout":           lambda: IntProperty(name="Timeout", default=DEFAULT_TIMEOUT, min=10, max=600),
+    "am3d_timeout":           lambda: IntProperty(name="Timeout", default=DEFAULT_TIMEOUT, min=10, max=900),
     "am3d_retry_limit":       lambda: IntProperty(name="Reintentos", default=DEFAULT_RETRIES, min=-1, max=9999),
     "am3d_feedback_notes":    lambda: StringProperty(name="Notas", default="Hazla más fluida y natural."),
     "am3d_feedback_step":     lambda: IntProperty(name="Step", default=2, min=1, max=10),
