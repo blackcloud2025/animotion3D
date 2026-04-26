@@ -2279,7 +2279,7 @@ _SCENE_PROPS = {
     "am3d_server_url":        lambda: StringProperty(name="URL", default=DEFAULT_URL),
     "am3d_model_name":        lambda: StringProperty(name="Modelo", default=DEFAULT_MODEL),
     "am3d_temperature":       lambda: FloatProperty(name="Temperatura", default=0.2, min=0.0, max=2.0, step=5),
-    "am3d_timeout":           lambda: IntProperty(name="Timeout", default=DEFAULT_TIMEOUT, min=10, max=900),
+    "am3d_timeout":           lambda: IntProperty(name="Timeout", default=DEFAULT_TIMEOUT, min=3600, max=10800),
     "am3d_retry_limit":       lambda: IntProperty(name="Reintentos", default=DEFAULT_RETRIES, min=-1, max=9999),
     "am3d_feedback_notes":    lambda: StringProperty(name="Notas", default="Hazla más fluida y natural."),
     "am3d_feedback_step":     lambda: IntProperty(name="Step", default=2, min=1, max=10),
