@@ -65,7 +65,8 @@ OUTPUT FORMAT:
 
 RULES:
 - frame >= 1, rot in DEGREES
-- Min 3 keyframes per moving element for smooth motion
+- Use SPARSE keyframes only: place keyframes only at key poses (start, peak, end of each movement). Let Blender interpolate between them. Do NOT place a keyframe on every frame.
+- Aim for 3-8 keyframes per movement arc, not one per frame.
 - Use EXACT bone/object names from scene list
 - Never animate objects outside the provided context list
 """
@@ -94,6 +95,11 @@ class AM3D_AnimItem(PropertyGroup):
     context_targets_json: StringProperty(name="Context targets", default="[]")
     applied:      BoolProperty(default=False)
     anim_type:    StringProperty(default="mixed")
+
+class AM3D_ScriptItem(PropertyGroup):
+    name:        StringProperty(name="Nombre")
+    description: StringProperty(name="Descripci\u00f3n")
+    code:        StringProperty(name="C\u00f3digo")
 
 # ══════════════════════════════════════════════════════
 #  CACHÉ DE ESCENA  —  evita scan en cada redibujado
@@ -1230,6 +1236,78 @@ def _collect_feedback_property_paths(actions, target_obj=None, context_objects=N
 # ══════════════════════════════════════════════════════
 #  FEEDBACK  —  sampleo y diff manual
 # ══════════════════════════════════════════════════════
+def read_keyframes_from_fcurves(scene, target_obj=None, context_objects=None):
+    """
+    Lee solo los keyframes reales desde las F-Curves (ignora frames interpolados).
+    Produce mucho menos tokens que sample_scene_animation para usar como contexto AI.
+    """
+    objects = _unique_animatable_objects(
+        context_objects or ([target_obj] if target_obj else [])
+    )
+
+    # Recopilar todos los frame numbers únicos con keyframe real
+    keyframe_frames: set[int] = set()
+    for obj in objects:
+        if obj.animation_data and obj.animation_data.action:
+            for fcurve in obj.animation_data.action.fcurves:
+                for kp in fcurve.keyframe_points:
+                    keyframe_frames.add(int(round(kp.co[0])))
+
+    if not keyframe_frames:
+        return []
+
+    prev = scene.frame_current
+    result = []
+    allowed_camera_names = {obj.name for obj in objects if obj.type == "CAMERA"}
+
+    for f in sorted(keyframe_frames):
+        scene.frame_set(f)
+        bpy.context.view_layer.update()
+        fd: dict[str, Any] = {"frame": f}
+
+        active_camera = _get_active_camera_at_frame(scene, f)
+        if active_camera and (not allowed_camera_names or active_camera.name in allowed_camera_names):
+            fd["active_camera"] = active_camera.name
+
+        bones_data = {}
+        for obj in objects:
+            if obj.type != "ARMATURE":
+                continue
+            for b in obj.pose.bones:
+                loc = [round(v, 4) for v in b.location]
+                rot = _get_rotation_degrees(b)
+                scl = [round(v, 4) for v in b.scale]
+                if (any(abs(v) > 1e-4 for v in loc) or
+                        any(abs(v) > 0.01 for v in rot) or
+                        any(abs(v - 1.0) > 1e-4 for v in scl)):
+                    bones_data[f"{obj.name}:{b.name}"] = {"loc": loc, "rot": rot, "scale": scl}
+        if bones_data:
+            fd["bones"] = bones_data
+
+        objs_data = {}
+        for obj in objects:
+            if obj.type not in ("ARMATURE", "MESH", "CAMERA", "LIGHT", "EMPTY", "CURVE"):
+                continue
+            loc = [round(v, 4) for v in obj.location]
+            rot = _get_rotation_degrees(obj)
+            scale = [round(v, 4) for v in obj.scale]
+            has_transform = (
+                any(abs(v) > 1e-4 for v in loc) or
+                any(abs(v) > 0.01 for v in rot) or
+                any(abs(v - 1.0) > 1e-4 for v in scale)
+            )
+            if has_transform:
+                objs_data[obj.name] = {"loc": loc, "rot": rot, "scale": scale}
+        if objs_data:
+            fd["objects"] = objs_data
+
+        if len(fd) > 1:
+            result.append(fd)
+
+    scene.frame_set(prev)
+    return result
+
+
 def sample_scene_animation(scene, start, end, step=2, target_obj=None, tracked_property_paths=None, context_objects=None):
     """
     Samplea la animación actual (bones + objetos) cada `step` frames.
@@ -1618,12 +1696,16 @@ class AM3D_OT_GenerateAnimation(Operator):
 
         context_objects = _resolve_context_objects(sc, target_obj=target_obj)
         scene_ctx  = scan_scene_context(sc, target_obj=target_obj, context_objects=context_objects)
+        scripts_ctx = _build_scripts_context(sc)
         full_prompt = (
             f"Animation/Behavior request: {prompt}\n\n"
             f"{_context_instruction(target_obj, context_objects)}\n\n"
             f"Scene:\n{json.dumps(scene_ctx, separators=(',', ':'))}\n\n"
-            f"Respond ONLY with JSON (animations, behaviors, notes)."
+            + (f"Available scripts:\n{scripts_ctx}\n\n" if scripts_ctx else "")
+            + f"Respond ONLY with JSON (animations, behaviors, notes)."
         )
+
+        sc.am3d_last_full_prompt = full_prompt
 
         _pending_data = {
             "prompt":        prompt,
@@ -1807,13 +1889,9 @@ class AM3D_OT_SendFeedback(Operator):
             target_obj=target_obj,
             context_objects=context_objects,
         )
-        current_state = sample_scene_animation(
+        current_state = read_keyframes_from_fcurves(
             sc,
-            sc.frame_start,
-            sc.frame_end,
-            step,
             target_obj=target_obj,
-            tracked_property_paths=tracked_property_paths,
             context_objects=context_objects,
         )
         manual_edits  = detect_manual_edits(original_actions, sc, sc.frame_start, sc.frame_end, step, target_obj=target_obj)
@@ -1828,13 +1906,16 @@ class AM3D_OT_SendFeedback(Operator):
             f"User notes: {notes}\n\n"
             f"{_context_instruction(target_obj, context_objects)}\n\n"
             f"Detected manual edits:\n{edits_desc}\n\n"
-            f"Current animation state (sampled every {step} frames):\n"
+            f"Current animation keyframes (actual keyframes only, interpolated frames excluded):\n"
             f"{json.dumps(current_state, indent=2)}\n\n"
             f"Scene behavior state:\n{json.dumps(scene_behavior_state, indent=2)}\n\n"
             f"Target details:\n{json.dumps(scene_ctx, indent=2)}\n\n"
             f"Reference scene:\n{json.dumps(reference_ctx, indent=2)}\n\n"
-            f"Respond with improved JSON (animations, behaviors, notes)."
+            + (_build_scripts_context(sc) and f"Available scripts:\n{_build_scripts_context(sc)}\n\n" or "")
+            + f"Respond with improved JSON (animations, behaviors, notes)."
         )
+
+        sc.am3d_last_full_prompt = full_prompt
 
         _pending_data = {
             "prompt":        notes,
@@ -2023,6 +2104,138 @@ class AM3D_OT_ClearContextTargets(Operator):
         return {"FINISHED"}
 
 
+# ── Preview Full Prompt (popup con texto copiable) ────
+class AM3D_OT_PreviewPrompt(Operator):
+    bl_idname      = "am3d.preview_prompt"
+    bl_label       = "Prompt enviado a la IA"
+    bl_description = "Muestra el último prompt completo enviado a la IA para revisarlo o copiarlo"
+
+    def invoke(self, context, event):
+        if not context.scene.am3d_last_full_prompt:
+            self.report({"WARNING"}, "Aún no se ha enviado ningún prompt.")
+            return {"CANCELLED"}
+        return context.window_manager.invoke_props_dialog(self, width=720)
+
+    def draw(self, context):
+        layout = self.layout
+        sc = context.scene
+        layout.label(text="Último prompt enviado a LM Studio:", icon="TEXT")
+        layout.separator(factor=0.5)
+        col = layout.column(align=True)
+        col.prop(sc, "am3d_last_full_prompt", text="")
+        layout.separator(factor=0.5)
+        layout.operator("am3d.copy_prompt_clipboard", text="Copiar al portapapeles", icon="COPYDOWN")
+
+    def execute(self, context):
+        return {"FINISHED"}
+
+
+class AM3D_OT_CopyPromptToClipboard(Operator):
+    bl_idname      = "am3d.copy_prompt_clipboard"
+    bl_label       = "Copiar prompt al portapapeles"
+    bl_description = "Copia el último prompt completo al portapapeles del sistema"
+
+    def execute(self, context):
+        sc = context.scene
+        if not sc.am3d_last_full_prompt:
+            self.report({"WARNING"}, "No hay prompt para copiar.")
+            return {"CANCELLED"}
+        context.window_manager.clipboard = sc.am3d_last_full_prompt
+        self.report({"INFO"}, "Prompt copiado al portapapeles.")
+        return {"FINISHED"}
+
+
+# ══════════════════════════════════════════════════════
+#  SCRIPTS
+# ══════════════════════════════════════════════════════
+def _build_scripts_context(sc) -> str:
+    """Devuelve los scripts guardados como contexto para el AI, si est\u00e1 activado."""
+    if not getattr(sc, "am3d_scripts_use_context", False) or not sc.am3d_scripts:
+        return ""
+    parts = ["User-defined Blender Python scripts available in this session:"]
+    for i, item in enumerate(sc.am3d_scripts):
+        parts.append(f"\n--- Script {i + 1}: {item.name} ---")
+        if item.description:
+            parts.append(f"Purpose: {item.description}")
+        parts.append(f"```python\n{item.code}\n```")
+    return "\n".join(parts)
+
+
+class AM3D_OT_RunScript(Operator):
+    bl_idname      = "am3d.run_script"
+    bl_label       = "Ejecutar script"
+    bl_description = "Ejecuta el script actual directamente en Blender"
+
+    def execute(self, context):
+        sc   = context.scene
+        code = sc.am3d_script_code.strip()
+        if not code:
+            _notify(self, sc, "ERROR", "El script est\u00e1 vac\u00edo.")
+            return {"CANCELLED"}
+        try:
+            exec(compile(code, "<am3d_script>", "exec"), {"bpy": bpy, "context": context})
+            _notify(self, sc, "INFO", "Script ejecutado correctamente.")
+        except Exception as e:
+            _notify(self, sc, "ERROR", f"Error en script: {e}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class AM3D_OT_SaveScript(Operator):
+    bl_idname      = "am3d.save_script"
+    bl_label       = "Guardar script"
+    bl_description = "Guarda el script actual en la biblioteca"
+
+    def execute(self, context):
+        sc   = context.scene
+        code = sc.am3d_script_code.strip()
+        name = sc.am3d_script_name.strip() or "Script sin nombre"
+        if not code:
+            _notify(self, sc, "ERROR", "El script est\u00e1 vac\u00edo.")
+            return {"CANCELLED"}
+        item             = sc.am3d_scripts.add()
+        item.name        = name
+        item.description = sc.am3d_script_desc.strip()
+        item.code        = code
+        sc.am3d_scripts_index = len(sc.am3d_scripts) - 1
+        _notify(self, sc, "INFO", f"Script '{name}' guardado en biblioteca.")
+        return {"FINISHED"}
+
+
+class AM3D_OT_DeleteScript(Operator):
+    bl_idname      = "am3d.delete_script"
+    bl_label       = "Borrar script"
+    bl_description = "Elimina el script seleccionado de la biblioteca"
+
+    def execute(self, context):
+        sc  = context.scene
+        idx = sc.am3d_scripts_index
+        if idx < 0 or idx >= len(sc.am3d_scripts):
+            return {"CANCELLED"}
+        name = sc.am3d_scripts[idx].name
+        sc.am3d_scripts.remove(idx)
+        sc.am3d_scripts_index = max(0, idx - 1)
+        _notify(self, sc, "INFO", f"Script '{name}' eliminado.")
+        return {"FINISHED"}
+
+
+class AM3D_OT_LoadScriptToEditor(Operator):
+    bl_idname      = "am3d.load_script_to_editor"
+    bl_label       = "Cargar en editor"
+    bl_description = "Carga el script seleccionado en el editor"
+
+    def execute(self, context):
+        sc  = context.scene
+        idx = sc.am3d_scripts_index
+        if idx < 0 or idx >= len(sc.am3d_scripts):
+            return {"CANCELLED"}
+        item                 = sc.am3d_scripts[idx]
+        sc.am3d_script_name  = item.name
+        sc.am3d_script_desc  = item.description
+        sc.am3d_script_code  = item.code
+        return {"FINISHED"}
+
+
 # ── Open SFT Folder ───────────────────────────────────
 class AM3D_OT_OpenSFTFolder(Operator):
     bl_idname     = "am3d.open_sft_folder"
@@ -2045,6 +2258,14 @@ class AM3D_OT_OpenSFTFolder(Operator):
 # ══════════════════════════════════════════════════════
 #  UI LIST
 # ══════════════════════════════════════════════════════
+class AM3D_UL_ScriptList(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.label(text=item.name[:28], icon="TEXT")
+        if item.description:
+            row.label(text=item.description[:28])
+
+
 class AM3D_UL_AnimList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
@@ -2189,6 +2410,7 @@ class AM3D_PT_Panel(Panel):
             row.operator("am3d.cancel_request", text="Cancelar petición", icon="CANCEL")
         else:
             row.operator("am3d.generate_animation", icon="SHADERFX", text="Generar con IA")
+            row.operator("am3d.preview_prompt", text="", icon="ZOOM_IN")
 
         conv_n = len(sc.am3d_conversation) // 2
         if conv_n:
@@ -2248,6 +2470,7 @@ classes = (
     AM3D_LogItem,
     AM3D_ContextTargetItem,
     AM3D_AnimItem,
+    AM3D_ScriptItem,
     AM3D_OT_GenerateAnimation,
     AM3D_OT_CancelRequest,        # NUEVO
     AM3D_OT_ApplyAnimation,
@@ -2260,7 +2483,14 @@ classes = (
     AM3D_OT_LoadRigMap,
     AM3D_OT_CaptureContextSelection,
     AM3D_OT_ClearContextTargets,
+    AM3D_OT_PreviewPrompt,
+    AM3D_OT_CopyPromptToClipboard,
+    AM3D_OT_RunScript,
+    AM3D_OT_SaveScript,
+    AM3D_OT_DeleteScript,
+    AM3D_OT_LoadScriptToEditor,
     AM3D_OT_OpenSFTFolder,
+    AM3D_UL_ScriptList,
     AM3D_UL_AnimList,
     AM3D_UL_LogList,
     AM3D_PT_Panel,
@@ -2284,6 +2514,13 @@ _SCENE_PROPS = {
     "am3d_feedback_notes":    lambda: StringProperty(name="Notas", default="Hazla más fluida y natural."),
     "am3d_feedback_step":     lambda: IntProperty(name="Step", default=2, min=1, max=10),
     "am3d_rigmap_json":       lambda: StringProperty(name="Rig Map JSON", default=""),
+    "am3d_scripts":           lambda: CollectionProperty(type=AM3D_ScriptItem),
+    "am3d_scripts_index":     lambda: IntProperty(default=0),
+    "am3d_script_name":       lambda: StringProperty(name="Nombre", default=""),
+    "am3d_script_desc":       lambda: StringProperty(name="Descripci\u00f3n", default=""),
+    "am3d_script_code":       lambda: StringProperty(name="C\u00f3digo", default=""),
+    "am3d_scripts_use_context": lambda: BoolProperty(name="Scripts como contexto IA", default=False),
+    "am3d_last_full_prompt":    lambda: StringProperty(name="Último Prompt", default=""),
 }
 
 
