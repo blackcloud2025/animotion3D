@@ -135,9 +135,10 @@ def _is_animatable_object(obj):
 
 def _object_transform_snapshot(obj):
     return {
-        "location": [round(v, 3) for v in obj.location],
-        "rotation": _get_rotation_degrees(obj, digits=2),
-        "scale": [round(v, 3) for v in obj.scale],
+        "location":      [round(v, 3) for v in obj.location],
+        "rotation":      _get_rotation_degrees(obj, digits=2),
+        "rotation_mode": getattr(obj, "rotation_mode", "XYZ"),
+        "scale":         [round(v, 3) for v in obj.scale],
     }
 
 
@@ -833,11 +834,33 @@ def scan_scene_context(scene, target_obj=None, context_objects=None):
     for obj in objects:
         d = {"name": obj.name, "type": obj.type}
         if obj.type == "ARMATURE":
-            d["bones"] = [b.name for b in obj.pose.bones]
+            d.update(_object_transform_snapshot(obj))
+            bone_poses = {}
+            for b in obj.pose.bones:
+                loc = [round(v, 3) for v in b.location]
+                rot = _get_rotation_degrees(b, digits=2)
+                scl = [round(v, 3) for v in b.scale]
+                rot_mode = getattr(b, "rotation_mode", "XYZ")
+                at_rest = (
+                    all(abs(v) < 1e-3 for v in loc) and
+                    all(abs(v) < 0.1 for v in rot) and
+                    all(abs(v - 1.0) < 1e-3 for v in scl)
+                )
+                bone_poses[b.name] = {"loc": loc, "rot": rot, "rotation_mode": rot_mode, "scale": scl} if not at_rest else {}
+            d["bones"] = list(bone_poses.keys())
+            non_rest = {name: pose for name, pose in bone_poses.items() if pose}
+            if non_rest:
+                d["bone_poses"] = non_rest
             ctx["armatures"].append(d)
         elif obj.type == "CAMERA":
             d.update(_object_transform_snapshot(obj))
-            d["properties"] = {"lens": round(obj.data.lens, 2)}
+            d["properties"] = {
+                "lens":         round(obj.data.lens, 2),
+                "clip_start":   round(obj.data.clip_start, 4),
+                "clip_end":     round(obj.data.clip_end, 2),
+                "sensor_width": round(obj.data.sensor_width, 2),
+                "sensor_fit":   obj.data.sensor_fit,
+            }
             ctx["cameras"].append(d)
         elif obj.type == "LIGHT":
             d.update(_object_transform_snapshot(obj))
