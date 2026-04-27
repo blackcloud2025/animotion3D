@@ -2168,6 +2168,27 @@ class AM3D_OT_CopyPromptToClipboard(Operator):
         return {"FINISHED"}
 
 
+# ── Ejecutar prompt como script Python ───────────────
+class AM3D_OT_RunPromptAsScript(Operator):
+    bl_idname      = "am3d.run_prompt_as_script"
+    bl_label       = "Ejecutar"
+    bl_description = "Ejecuta el contenido del campo de texto como script Python en Blender"
+
+    def execute(self, context):
+        sc   = context.scene
+        code = sc.am3d_prompt_text.strip()
+        if not code:
+            _notify(self, sc, "ERROR", "El campo de texto está vacío.")
+            return {"CANCELLED"}
+        try:
+            exec(compile(code, "<am3d_prompt_script>", "exec"), {"bpy": bpy, "context": context})
+            _notify(self, sc, "INFO", "Script ejecutado correctamente.")
+        except Exception as e:
+            _notify(self, sc, "ERROR", f"Error en script: {e}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 # ══════════════════════════════════════════════════════
 #  SCRIPTS
 # ══════════════════════════════════════════════════════
@@ -2433,6 +2454,7 @@ class AM3D_PT_Panel(Panel):
             row.operator("am3d.cancel_request", text="Cancelar petición", icon="CANCEL")
         else:
             row.operator("am3d.generate_animation", icon="SHADERFX", text="Generar con IA")
+            row.operator("am3d.run_prompt_as_script", text="Ejecutar", icon="CONSOLE")
             row.operator("am3d.preview_prompt", text="", icon="ZOOM_IN")
 
         conv_n = len(sc.am3d_conversation) // 2
@@ -2512,6 +2534,7 @@ classes = (
     AM3D_OT_SaveScript,
     AM3D_OT_DeleteScript,
     AM3D_OT_LoadScriptToEditor,
+    AM3D_OT_RunPromptAsScript,
     AM3D_OT_OpenSFTFolder,
     AM3D_UL_ScriptList,
     AM3D_UL_AnimList,
